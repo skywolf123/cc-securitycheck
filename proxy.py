@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cc-securitycheck —— 本地 DeepSeek 中转（Claude Code / DeepSeek flash + pro）
+cc-securitycheck —— 本地中转，让 Claude Code 在非原生模型上也能用好 auto mode
 
 作用：
-  1. 安全分类器请求（auto 模式审批前的 severity 判定调用）改走上游的 OpenAI 兼容端点
-     /v1/chat/completions，并带 thinking:{"type":"disabled"} —— 让推理模型不推理、
-     直接出 <severity> 结论。分类器只给 64/256 token，若放任推理会烧光预算、
-     吐不出结论，导致分类器 fail-closed 拦截所有有副作用的工具；
-  2. 其余请求原样透传到 Anthropic 兼容端点，思考强度完全跟随 Claude Code 的 effort 配置。
+  1. 分类器请求（auto 模式审批副作用工具前的那次独立调用）：去掉 max_tokens
+     （不限制输出长度、消除截断）、补 thinking:{"type":"disabled"}（能识别的上游省掉推理）；
+  2. 分类器响应：截取 <block> 及之后的内容，丢掉模型写在 verdict 前的推理，
+     让 CC 拿到"以 <block> 开头"的干净文本；
+  3. 其余请求原样透传，思考强度完全跟随 Claude Code 的 effort 配置。
 
-为什么分类器必须换端点（2026-10-08 实测，见 README「上游协议差异」）：
-  上游只在 OpenAI 协议路径上实现了 thinking:{"type":"disabled"}；
-  Anthropic 端点 /v1/messages 收到该字段会静默忽略，照常推理。
-  实测 reasoning_tokens：OpenAI 端点 [0, 0] vs Anthropic 端点 409~914（与 baseline 无异）。
+三步全部作用在 Anthropic /v1/messages 上 —— 不换端点、不做协议转换，
+因此不依赖上游对 OpenAI 协议的实现，也不随上游模型映射变化而失效。
+分类器 system 要求 "Your ENTIRE response MUST begin with <block>"，
+非原生推理模型会先写推理，输出再被截断就永远吐不出 verdict，
+CC 解析不到即 fail-closed，拦下所有有副作用的工具。
 
 依赖：仅 Python 标准库，无任何第三方包。
 配置：全部走环境变量（均有默认值），也可写在同目录 .env 里（真实环境变量优先）。
@@ -79,13 +80,14 @@ CLASSIFIER_NO_THINK = os.environ.get("CLASSIFIER_NO_THINK", "1").strip().lower()
 # ---------------------------------------------------------------------------
 # 分类器判定
 #
-# 依据 2026-10-08 实测的真实请求（见 README「分类器请求的真实形态」）：
-#   - system 首句固定： "You are a security monitor for autonomous AI coding agents."
-#   - 输出契约固定：   "Your ENTIRE response MUST begin with <block>."
-#   - max_tokens 实为 2112（并非早期记载的 64/256），stream 为 false。
+# 依据 2026-10-08 实测的真实请求：
+#   - system 首句： "You are a security monitor for autonomous AI coding agents."
+#   - 输出契约：   "Your ENTIRE response MUST begin with <block>."
+#   - 请求体： max_tokens=2112，stream=false，thinking 未设置。
 #
-# 判定只看 system 里这两条独有标记：比 "severity" 之类泛词精确得多
-# （本仓库自己的 README 就满是 severity，用泛词会被自身内容误伤）。
+# 只看 system 里这两条独有标记 —— 不用 max_tokens 阈值（真实分类器为 2112，
+# 阈值判定不会触发却会误伤正常的小请求），也不用 "severity" 之类泛词
+# （项目自身的 CLAUDE.md 里就可能出现，会把正常请求误判成分类器）。
 #
 # 取舍：宁可漏判，不可误判 —— 漏判只让分类器回到 fail-closed（报错显眼、已知）；
 # 误判则会把"改写"施加到正常请求上（静默改坏数据）。故取精不取全。
@@ -97,10 +99,9 @@ CLASSIFIER_MARKERS = (
 
 BUFFER = 8192
 
-# 分类器响应里 verdict 的起点：<block>yes|no</block>。取其及之后的内容回给 CC，
-# 丢掉模型在 verdict 前面写的一切（推理/解释）—— 分类器 system 明确要求
-# "Your ENTIRE response MUST begin with <block>"，前置内容全是模型没听话的部分。
-_VERDICT_RE = re.compile(r"<(severity|block)>.*", re.I | re.S)
+# 分类器响应里 verdict 的起点：system 要求输出 <block>…</block>，
+# 取 <block> 及之后的内容回给 CC，丢掉模型在它前面写的一切（推理/解释）。
+_VERDICT_RE = re.compile(r"<block>.*", re.I | re.S)
 
 
 def _ts() -> str:
@@ -306,10 +307,10 @@ class Handler(BaseHTTPRequestHandler):
     def _rewrite_classifier_response(self, raw: bytes) -> dict:
         """对 Anthropic /v1/messages 的非流式响应做"截取 verdict"改写。
 
-        - 在 text block 里找 verdict（<block>… 或旧 <severity>…），
-          命中则把该 block 截成"从 verdict 开始"，并丢弃其后的 text block；
-        - 找不到 verdict → 原样返回（fail-closed 交给 CC 自己处理）。
-        解析失败/非 JSON 也原样返回，保证这条路径永不比透传更糟。
+        - 在 content 里找 <block>，命中则只保留"从 <block> 开始"的那一个 text block，
+          其前的所有内容（推理、解释）与其后的块全部丢弃；
+        - 找不到 <block> → 原样返回，让 CC 自己按 fail-closed 处理；
+        - 解析失败/非 JSON 也原样返回 —— 这条路径永不比透传更糟。
         """
         fail = {"_note": "pass-through(非JSON)"}
         try:
