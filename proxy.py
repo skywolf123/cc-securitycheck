@@ -11,7 +11,8 @@ cc-securitycheck —— 本地 DeepSeek 中转（Claude Code / DeepSeek flash + 
   3. 其余请求原样透传，思考强度完全跟随 Claude Code 内部的 effort 配置。
 
 依赖：仅 Python 标准库，无任何第三方包。
-配置：全部走环境变量（均有默认值），见 README.md 与 start.bat。
+配置：全部走环境变量（均有默认值），也可写在同目录 .env 里（真实环境变量优先）。
+      见 README.md、start.bat 与 .env.example。
 """
 
 import http.client
@@ -19,6 +20,37 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+
+def _load_dotenv(filename=".env") -> None:
+    """零依赖 .env 加载器（无第三方包）。
+
+    - 只认 KEY=VALUE，跳过空行与 # 注释；值两侧的引号会被剥掉。
+    - 已存在的真实环境变量优先（os.environ.setdefault），便于临时覆盖调试。
+    - 路径取自脚本所在目录，不依赖 cwd —— start.bat 用 %~dp0 启动，cwd 不定。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                if not key:
+                    continue
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                    val = val[1:-1]
+                os.environ.setdefault(key, val)
+    except OSError as e:
+        print("[warn] 读取 %s 失败，忽略：%s" % (path, e), flush=True)
+
+
+_load_dotenv()  # 必须在下面读配置之前调用
 
 # ---------------------------------------------------------------------------
 # 配置（环境变量，均可缺省）

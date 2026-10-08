@@ -52,8 +52,9 @@ auto 模式报 `... is temporarily unavailable, so auto mode cannot determine th
 
 ## 文件
 
-- `proxy.py`   —— 中转本体，仅 Python 标准库，零第三方依赖
-- `start.bat`  —— Windows 一键启动，顶部是常用配置区
+- `proxy.py`      —— 中转本体，仅 Python 标准库，零第三方依赖
+- `start.bat`     —— Windows 一键启动，顶部是常用配置区
+- `.env.example`  —— 配置示例，复制为 `.env` 即可生效
 
 ## 使用
 
@@ -78,12 +79,24 @@ ANTHROPIC_MODEL=deepseek-v4-flash[1M]   # 或用 /model 切换
 
 ## 配置（环境变量，全部有默认值）
 
+三种来源，优先级从高到低：
+
+1. **真实环境变量** —— 临时覆盖调试用，如 `PROXY_PORT=9000 python proxy.py`
+2. **`start.bat` 顶部配置区** —— Windows 双击启动时生效
+3. **同目录 `.env`** —— 复制 `.env.example` 为 `.env` 后修改（`.env` 已被 gitignore）
+
 | 变量            | 默认值                                  | 说明                                   |
 |-----------------|-----------------------------------------|----------------------------------------|
 | `PROXY_HOST`    | `127.0.0.1`                             | 监听地址                               |
 | `PROXY_PORT`    | `8008`                                  | 监听端口                               |
 | `UPSTREAM`      | `https://api.deepseek.com/anthropic`    | DeepSeek Anthropic 兼容端点            |
 | `MODEL_OVERRIDE`| 空                                      | 统一改写 model 字段；留空则透传 CC 的   |
+
+> `.env` 由 `proxy.py` 用标准库自行读取（零依赖），路径取脚本所在目录，与启动时的
+> cwd 无关；已存在的环境变量不会被 `.env` 覆盖。
+>
+> 注意：这里的 `.env` 只服务 `proxy.py`。CC 自己的 `ANTHROPIC_*` 变量由 CC 进程读取，
+> 需配在 `~/.claude/settings.json` 的 `env` 字段或启动 CC 前的 shell 环境里。
 
 ## 行为
 
