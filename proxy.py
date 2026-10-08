@@ -143,13 +143,6 @@ def is_classifier(body: dict) -> bool:
     return bool(classifier_hits(body))
 
 
-# ---------------------------------------------------------------------------
-# 分类器请求的协议转换：Anthropic /v1/messages ↔ OpenAI /v1/chat/completions
-#
-# 只服务分类器这一类请求 —— 它是纯文本判定调用，不含工具调用与多模态，
-# 因此转换只需搬运 system / messages / max_tokens / temperature。
-# ---------------------------------------------------------------------------
-
 def _to_text(content) -> str:
     """Anthropic content（str 或 content-block 数组）→ 纯文本。"""
     if isinstance(content, str):
@@ -293,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    # ---- 分类器专用：Anthropic 请求 → OpenAI 端点 → Anthropic 响应 ----
+    # ---- 分类器专用：记录请求关键字段（改写与截取在 _forward 里完成）----
     def _log_classifier_in(self, data: dict):
         """记录 CC 分类器请求的关键字段 —— 一行，便于确认判定与 CC 是否自带 thinking。"""
         hits = classifier_hits(data)

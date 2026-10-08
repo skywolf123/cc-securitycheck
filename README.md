@@ -161,7 +161,7 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 | `块[...]` | 改写前响应里的 block 类型；出现 `thinking` 说明模型没听话、输出了推理 |
 | `think…B` | thinking 块内容字节数（0 = 未输出推理） |
 | `out=…` / `stop=…` | 上游报的 token 数与结束原因（`stop=max_tokens` = 又被截断了） |
-| `最后一段` | `trimmed` / `verdict=MISSING` / `pass-through(非JSON)` |
+| `最后一段` | `trimmed` / `verdict=MISSING` / `pass-through(非JSON)` / `pass-through(无content)` |
 
 三种结果的含义：
 
@@ -169,6 +169,7 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 - **`verdict=MISSING`** —— 响应里找不到 `<block>`，**原样放行**交给 CC（fail-closed，
   不比不透传更差）。频繁出现说明模型没按契约输出，或标记词已过期。
 - **`pass-through(非JSON)`** —— 上游返回了非 JSON（网关偶发空 body），原样透传。
+- **`pass-through(无content)`** —— 响应是 JSON 但没有 `content` 数组，原样透传。
 
 ## 边界与已知限制
 
