@@ -114,12 +114,30 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 | `PROXY_PORT`                  | `8008`                               | 监听端口 |
 | `UPSTREAM`                    | `https://api.deepseek.com/anthropic` | 上游 Anthropic 兼容端点 |
 | `MODEL_OVERRIDE`              | 空                                   | 仅分类器改写 model 字段；留空则透传 CC 的 |
+| `THINKING_OVERRIDE`           | 空                                   | 仅分类器覆盖思考强度；留空则不改（见下） |
 | `CLASSIFIER_CAP_MAX_TOKENS`   | `1`（开）                            | 分类器**去掉 `max_tokens`**，避免截断 |
 | `CLASSIFIER_NO_THINK`         | `1`（开）                            | 分类器补 `thinking:{"type":"disabled"}` |
 | `CLASSIFIER_DUMP_REQ`         | `0`（关）                            | 置 `1` 打印 CC 分类器**请求**全文，排障用 |
 | `CLASSIFIER_DUMP_RAW`         | `0`（关）                            | 置 `1` 打印上游分类器**响应**全文（改写前），排障用 |
 
 这些开关都可独立置 `0`/`false`/`off` 关闭，用于对照排查。
+
+### 分类器的思考强度
+
+`MODEL_OVERRIDE` 与 `THINKING_OVERRIDE` 都**只作用于分类器**，主对话一律透传。
+
+`THINKING_OVERRIDE`（留空 = 不改）取值：
+
+| 值 | 效果 |
+|---|---|
+| `disabled` / `off` / `none` | `{"type":"disabled"}`，完全关闭思考 |
+| `low` / `medium` / `high` | `{"type":"enabled","budget_tokens":1024/4096/16384}`，**降档但不关闭** |
+| 任意数字 | 直接当 `budget_tokens` |
+
+> **为什么需要它**：有些模型不认 `disabled`、**关不掉思考**，`CLASSIFIER_NO_THINK` 对它无效；
+> 这类模型可改用 `low`/`medium` 把推理预算压小，从而更快吐出 verdict。
+>
+> 优先级：`THINKING_OVERRIDE` 非空时优先，此时 `CLASSIFIER_NO_THINK` 不再生效。
 
 排障打印是两个**独立**开关（会刷屏，仅排障时开）。只看返回时，只开 `CLASSIFIER_DUMP_RAW` 即可：
 
@@ -169,7 +187,7 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 | 字段 | 含义 |
 |---|---|
 | `命中=` | 命中了哪条标记（`?` = 一条都没中，判定可能已失效） |
-| `thinking=` | CC **原样**发来的 thinking 字段（`<未设置>` = CC 没带，需中转补） |
+| `thinking=` | CC **原始**请求的思考强度：原样请求的 `thinking` 字段；没带时显示 `effort=…`（CC 档位，透传不改）；都没有则 `<未设置>` |
 | `verdict=…` | 回给 CC 的**完整**最终文本（截取后，Python repr：能看出尾随空白）；`MISSING` 时是原样透传输出的尾部预览 |
 | `(块N丢M字)` | verdict 位于第 N 个 block；M = 丢弃的「前缀 + 其它块（含 thinking） + 被丢的 text 块」总长度 |
 | `块[...]` | 改写前响应里的 block 类型；出现 `thinking` 说明模型没听话、输出了推理 |

@@ -70,9 +70,18 @@ UPSTREAM = os.environ.get("UPSTREAM", "https://api.deepseek.com/anthropic")
 # 留空则透传 CC 的 model。主请求永远透传，不受此项影响。
 MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "").strip()
 
+# 可选：仅分类器覆盖思考强度（thinking 字段）。取值（大小写不敏感）：
+#   disabled / off / none —— {"type":"disabled"}，完全关闭思考；
+#   low / medium / high  —— {"type":"enabled","budget_tokens":...}，降档但不关闭；
+#   空                    —— 不覆盖（交由 CLASSIFIER_NO_THINK 决定是否补 disabled）。
+# 有些模型不认 disabled、无法关闭思考，可用这个降档减少推理。
+THINKING_OVERRIDE = os.environ.get("THINKING_OVERRIDE", "").strip()
+_THINK_BUDGETS = {"low": 1024, "medium": 4096, "high": 16384}
+
 # 分类器改写（均可在 .env 里置 0/false/off 关闭）：
 #   CLASSIFIER_CAP_MAX_TOKENS —— 去掉 max_tokens，让模型推完再出结论，不再被截断；
 #   CLASSIFIER_NO_THINK       —— 补 thinking:{"type":"disabled"}，能识别该字段的上游可省推理。
+# 注意：THINKING_OVERRIDE 非空时优先，CLASSIFIER_NO_THINK 不再生效。
 CLASSIFIER_CAP_MAX_TOKENS = os.environ.get("CLASSIFIER_CAP_MAX_TOKENS", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 CLASSIFIER_NO_THINK = os.environ.get("CLASSIFIER_NO_THINK", "1").strip().lower() \
@@ -86,6 +95,26 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 CLASSIFIER_DUMP_REQ = _env_bool("CLASSIFIER_DUMP_REQ")
 CLASSIFIER_DUMP_RAW = _env_bool("CLASSIFIER_DUMP_RAW")
+
+
+def build_thinking_override():
+    """把 THINKING_OVERRIDE 解析成 thinking 对象；未配置返回 None。"""
+    v = THINKING_OVERRIDE.lower()
+    if not v:
+        return None
+    if v in ("disabled", "off", "none"):
+        return {"type": "disabled"}
+    if v in _THINK_BUDGETS:
+        return {"type": "enabled", "budget_tokens": _THINK_BUDGETS[v]}
+    # 也接受裸数字，直接当 budget_tokens（上限给足，避免被上游截断）
+    if v.isdigit():
+        return {"type": "enabled", "budget_tokens": int(v)}
+    print("[warn] THINKING_OVERRIDE=%r 无法识别（可用 disabled/low/medium/high 或数字），忽略"
+          % THINKING_OVERRIDE, flush=True)
+    return None
+
+
+THINKING_OVERRIDE_VALUE = build_thinking_override()
 
 # ---------------------------------------------------------------------------
 # 分类器判定
@@ -242,7 +271,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._log_classifier_req(data)
             if CLASSIFIER_CAP_MAX_TOKENS and data.pop("max_tokens", None) is not None:
                 modified = True
-            if CLASSIFIER_NO_THINK:
+            if THINKING_OVERRIDE_VALUE is not None:
+                data["thinking"] = THINKING_OVERRIDE_VALUE
+                modified = True
+            elif CLASSIFIER_NO_THINK:
                 data["thinking"] = {"type": "disabled"}
                 modified = True
             if MODEL_OVERRIDE:
@@ -283,7 +315,10 @@ class Handler(BaseHTTPRequestHandler):
         content_length = resp.getheader("Content-Length")
 
         if is_cls and content_length is not None:
-            raw = resp.read(int(content_length))
+            try:
+                raw = resp.read(int(content_length))
+            except http.client.IncompleteRead as e:   # 上游中途断流
+                raw = e.partial
             conn.close()
             payload = self._rewrite_classifier_response(raw)
             note = payload.pop("_note", "")   # _note 只进日志，不回给 CC
@@ -322,29 +357,42 @@ class Handler(BaseHTTPRequestHandler):
                 if remaining >= 0:
                     if remaining <= 0:
                         break
-                    chunk = resp.read(min(BUFFER, remaining))
+                    n = min(BUFFER, remaining)
                 else:
-                    chunk = resp.read(BUFFER)
+                    n = BUFFER
+                try:
+                    chunk = resp.read(n)
+                except http.client.IncompleteRead as e:   # 上游中途断流
+                    chunk = e.partial                # 已读到的部分先发给 CC
+                except (ConnectionResetError, OSError):
+                    break                            # 读取出错 → 停止，交给 finally 关连接
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break                            # 客户端提前断开 → 停止
                 if remaining >= 0:
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # 客户端提前断开
         finally:
             conn.close()
 
     # ---- 分类器专用：记录请求关键字段（改写与截取在 _forward 里完成）----
     def _log_classifier_in(self, data: dict):
-        """记录 CC 分类器请求的关键字段 —— 一行，便于确认判定与 CC 是否自带 thinking。"""
+        """记录 CC 分类器请求的关键字段 —— 一行，便于确认判定与 CC 原始的思考强度。"""
         hits = classifier_hits(data)
         th = data.get("thinking")
-        th_repr = json.dumps(th, ensure_ascii=False) if th is not None else "<未设置>"
+        # 显示 CC 原始请求的思考强度：未带 thinking 时回落到 effort（CC 的思考档位，透传不改）。
+        if th is not None:
+            shown = json.dumps(th, ensure_ascii=False)
+        elif data.get("effort") is not None:
+            shown = "effort=%s（无 thinking）" % data.get("effort")
+        else:
+            shown = "<未设置>"
         print("[%s] [CLASSIFIER-IN] model=%s max_tokens=%s stream=%s 命中=%s thinking=%s"
               % (_ts(), data.get("model", "?"), data.get("max_tokens", "?"),
-                 data.get("stream", False), "+".join(hits) or "?", th_repr), flush=True)
+                 data.get("stream", False), "+".join(hits) or "?", shown), flush=True)
 
     # ---- 分类器响应改写：截取 <block> 及之后，丢弃其前面的推理 ----
     def _rewrite_classifier_response(self, raw: bytes) -> dict:
@@ -439,7 +487,9 @@ def main():
     steps = []
     if CLASSIFIER_CAP_MAX_TOKENS:
         steps.append("去掉 max_tokens")
-    if CLASSIFIER_NO_THINK:
+    if THINKING_OVERRIDE_VALUE is not None:
+        steps.append("思考改写->%s" % json.dumps(THINKING_OVERRIDE_VALUE, ensure_ascii=False))
+    elif CLASSIFIER_NO_THINK:
         steps.append("think:disabled")
     if MODEL_OVERRIDE:
         steps.append("模型改写->%s" % MODEL_OVERRIDE)
