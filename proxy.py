@@ -66,7 +66,8 @@ _load_dotenv()  # 必须在下面读配置之前调用
 HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "8008"))
 UPSTREAM = os.environ.get("UPSTREAM", "https://api.deepseek.com/anthropic")
-# 可选：统一改写 model 字段（如 "deepseek-v4-flash[1M]"）；留空则透传 CC 的 model。
+# 可选：仅分类器改写 model 字段（如 "deepseek-chat"、"glm-4-flash" 等轻量模型）；
+# 留空则透传 CC 的 model。主请求永远透传，不受此项影响。
 MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "").strip()
 
 # 分类器改写（均可在 .env 里置 0/false/off 关闭）：
@@ -76,6 +77,15 @@ CLASSIFIER_CAP_MAX_TOKENS = os.environ.get("CLASSIFIER_CAP_MAX_TOKENS", "1").str
     not in ("0", "false", "no", "off")
 CLASSIFIER_NO_THINK = os.environ.get("CLASSIFIER_NO_THINK", "1").strip().lower() \
     not in ("0", "false", "no", "off")
+# 排障用（两个独立开关，日常都关）：
+#   CLASSIFIER_DUMP_REQ —— 打印 CC 分类器请求全文；
+#   CLASSIFIER_DUMP_RAW —— 打印上游分类器响应全文（改写前、原样）。
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+CLASSIFIER_DUMP_REQ = _env_bool("CLASSIFIER_DUMP_REQ")
+CLASSIFIER_DUMP_RAW = _env_bool("CLASSIFIER_DUMP_RAW")
 
 # ---------------------------------------------------------------------------
 # 分类器判定
@@ -165,6 +175,44 @@ def _to_text(content) -> str:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    LOG_PREVIEW = 240   # 日志里 verdict 文本预览的最大字符数（分类器输出通常远小于此）
+
+    # ---- 把响应文本压成单行预览，超长截断（tail=True 取尾部）----
+    def _preview(self, text: str, tail: bool = False) -> str:
+        """仅用于日志：去掉首尾空白、换行转义，太长则截断，避免刷屏。"""
+        s = (text or "").strip().replace("\r", "").replace("\n", "\\n")
+        limit = self.LOG_PREVIEW
+        if len(s) <= limit:
+            return s
+        return ("..." + s[-limit:]) if tail else (s[:limit] + "...")
+
+    def _log_classifier_req(self, data: dict):
+        """CLASSIFIER_DUMP_REQ=1 时：把分类器请求体**全文**原样打到日志，供排障。"""
+        try:
+            shown = json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            shown = repr(data)
+        print("[%s] [CLASSIFIER-REQ] %dB\n%s" % (_ts(), len(shown), shown), flush=True)
+
+    def _log_classifier_raw(self, raw: bytes):
+        """CLASSIFIER_DUMP_RAW=1 时：把分类器响应**改写前**的全文原样打到日志，供排障。"""
+        try:
+            shown = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            shown = repr(raw)
+        print("[%s] [CLASSIFIER-RAW] %dB\n%s" % (_ts(), len(raw), shown), flush=True)
+
+    def _verdict_repr(self, text: str) -> str:
+        """日志用的 verdict 文本表示：完整打印，仅在超过 LOG_PREVIEW 时截断（带数量提示）。
+
+        不 strip —— verdict 前后的空白/换行往往是 CC 解析失败的主因，必须让它现形。
+        """
+        s = text.replace("\r", "").replace("\n", "\\n")
+        limit = self.LOG_PREVIEW
+        if len(s) <= limit:
+            return repr(s)
+        return "%r...（等共%d字，仅示前%d字）" % (s[:limit], len(s), limit)
+
     # ---- 通用转发（所有方法） ----
     def _forward(self):
         # 1. 读请求体
@@ -185,19 +233,21 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeDecodeError):
                 pass  # 非 JSON 或解码失败 → 原样透传
 
-        # 3. 分类器改写：去掉 max_tokens（不截断）+ 补 thinking disabled（能认的上游省推理）。
-        #    仍在 /v1/messages 上发，不换端点、不做协议转换。
+        # 3. 分类器改写：去掉 max_tokens（不截断）+ 补 thinking disabled（能认的上游省推理）+ 可选覆盖分类器模型。
+        #    仅作用于分类器请求，主模型请求完全原样透传。
         modified = False
         if is_cls:
             self._log_classifier_in(data)
+            if CLASSIFIER_DUMP_REQ:
+                self._log_classifier_req(data)
             if CLASSIFIER_CAP_MAX_TOKENS and data.pop("max_tokens", None) is not None:
                 modified = True
             if CLASSIFIER_NO_THINK:
                 data["thinking"] = {"type": "disabled"}
                 modified = True
-        if MODEL_OVERRIDE and isinstance(data, dict):
-            data["model"] = MODEL_OVERRIDE
-            modified = True
+            if MODEL_OVERRIDE:
+                data["model"] = MODEL_OVERRIDE
+                modified = True
         if modified:
             body = json.dumps(data).encode("utf-8")
 
@@ -313,20 +363,36 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return fail
 
+        if CLASSIFIER_DUMP_RAW:
+            self._log_classifier_raw(raw)
+
         content = resp.get("content")
         if not isinstance(content, list):
             resp["_note"] = "pass-through(无content)"
             return resp
 
-        # 统计改写前的内容概况：块类型（thinking 字段即模型没听话、输出了推理）+ 正文字节数。
-        kinds = ",".join(b.get("type", "?") for b in content if isinstance(b, dict))
-        raw_text = "".join(b.get("text") or "" for b in content
-                           if isinstance(b, dict) and b.get("type") == "text")
-        think_len = sum(len(b.get("thinking") or "") for b in content
-                        if isinstance(b, dict) and b.get("type") == "thinking")
+        # 统计改写前的内容概况：块类型 + 各类内容长度，便于核对 usage 里 token 的去向。
+        #   text     —— verdict 所在（会截取）
+        #   thinking —— 模型没听话、输出了推理（会丢弃）
+        #   other    —— 其它未知块，取 JSON 序列化长度；out 远大于 text+think 时看这里
+        kinds = []
+        raw_text = ""
+        think_len = 0
+        other_len = 0
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type", "?")
+            kinds.append(t)
+            if t == "text":
+                raw_text += b.get("text") or ""
+            elif t == "thinking":
+                think_len += len(b.get("thinking") or "")
+            else:
+                other_len += len(json.dumps(b, ensure_ascii=False).encode("utf-8"))
         u = resp.get("usage") or {}
-        base = "块[%s] 正文%dB think%dB out=%s stop=%s" % (
-            kinds, len(raw_text.encode("utf-8")), think_len,
+        base = "块[%s] 正文%dB think%dB other%dB out=%s stop=%s" % (
+            ",".join(kinds), len(raw_text.encode("utf-8")), think_len, other_len,
             u.get("output_tokens"), resp.get("stop_reason"))
 
         cut_at = None          # (block 序号, 匹配起点)
@@ -338,19 +404,24 @@ class Handler(BaseHTTPRequestHandler):
                 cut_at = (i, m.start())
                 break
         if cut_at is None:
-            # 找不到 verdict：原样放行，fail-closed 与否交给 CC 自己判
-            resp["_note"] = "verdict=MISSING " + base
+            # 找不到 verdict：原样放行，fail-closed 与否交给 CC 自己判。
+            # 此时回给 CC 的就是全文，打印摘要 + 尾部预览（尾部即截断发生处，最有用）。
+            resp["_note"] = "verdict=MISSING %s output=%r" % (
+                base, self._preview(raw_text, tail=True))
             return resp
 
         i, start = cut_at
         # 只保留截断后的这一个 text block —— verdict 之前（含其它块）与之后的内容全丢。
         # 分类器响应就一个 verdict， CC 拿到"以 <block> 开头"的干净文本。
-        resp["content"] = [dict(content[i], text=content[i]["text"][start:])]
-        kept = len(resp["content"][0]["text"].encode("utf-8"))
-        print("[%s] [CLASSIFIER-TRIM] verdict 位于第 %d 块，丢 %d 字前缀，保留 %dB：%s"
-              % (_ts(), i, len(raw_text) - len(resp["content"][0]["text"]), kept, base),
-              flush=True)
-        resp["_note"] = "trimmed " + base
+        trimmed_text = content[i]["text"][start:]
+        resp["content"] = [dict(content[i], text=trimmed_text)]
+        # 丢失的“字符”里既有丢失的块（thinking / other），也含被丢的前缀；只丢块也要报，
+        # 否则 verdict 不完整时（如少了 </block>）日志会静默看不出任何异常。
+        # other 块无法直接按字符算，用序列化字节数近似（仅用于日志提示，不参与改写）。
+        before_chars = len(raw_text) + think_len + other_len
+        dropped_chars = before_chars - len(trimmed_text)
+        resp["_note"] = "trimmed %s verdict=%s (块%d丢%d字)" % (
+            base, self._verdict_repr(trimmed_text), i, dropped_chars)
         return resp
 
     def log_message(self, *args):
@@ -365,14 +436,19 @@ def main():
     print("cc-securitycheck 本地 DeepSeek 中转已启动", flush=True)
     print("  监听     : http://%s:%s" % (HOST, PORT), flush=True)
     print("  上游     : %s" % UPSTREAM, flush=True)
-    print("  模型覆盖 : %s" % (MODEL_OVERRIDE or "(透传，跟随 Claude Code 配置)"), flush=True)
     steps = []
     if CLASSIFIER_CAP_MAX_TOKENS:
         steps.append("去掉 max_tokens")
     if CLASSIFIER_NO_THINK:
         steps.append("think:disabled")
-    print("  分类器   : %s（仍在 Anthropic 端点）" % (" + ".join(steps) or "原样透传"), flush=True)
-    print("  其他请求 : 原样透传 %s（思考强度跟随 CC 内部 effort 配置）" % UPSTREAM, flush=True)
+    if MODEL_OVERRIDE:
+        steps.append("模型改写->%s" % MODEL_OVERRIDE)
+    print("  分类器   : %s（仅作用于分类器）" % (" + ".join(steps) or "原样透传"), flush=True)
+    if CLASSIFIER_DUMP_REQ or CLASSIFIER_DUMP_RAW:
+        print("  排障打印 : %s" % " + ".join(
+            n for n, on in (("请求全文", CLASSIFIER_DUMP_REQ),
+                            ("响应全文", CLASSIFIER_DUMP_RAW)) if on), flush=True)
+    print("  其他请求 : 原样透传 %s（思考强度与模型跟随 CC 配置）" % UPSTREAM, flush=True)
     print("  CC 配置  : ANTHROPIC_BASE_URL=http://%s:%s" % (HOST, PORT), flush=True)
     print("=" * 58, flush=True)
     try:

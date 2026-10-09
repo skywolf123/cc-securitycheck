@@ -8,7 +8,7 @@ rem ============================================================
 rem   如需临时覆盖，取消下面某行注释即可（环境变量优先于 .env）：
 rem set PROXY_PORT=8008
 rem set UPSTREAM=https://api.deepseek.com/anthropic
-rem set MODEL_OVERRIDE=deepseek-v4-flash[1M]
+rem set MODEL_OVERRIDE=deepseek-chat
 rem ============================================================
 
 python "%~dp0proxy.py"

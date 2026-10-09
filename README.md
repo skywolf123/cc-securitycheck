@@ -53,7 +53,7 @@ auto 模式报 `... is temporarily unavailable, so auto mode cannot determine th
   但推理模型会先写推理；若输出再被 `max_tokens` 截断，`<block>` 永远吐不出来。
 - 分类器 **fail-closed** 拦截所有有副作用工具，并报误导性的 "temporarily unavailable"。
 - **时间特征：确定性**——同一输入 100% 复现。
-- **判别信号**：走本中转后日志出现 `[CLASSIFIER-TRIM] ... trimmed` 且正常出 verdict，即可证实。
+- **判别信号**：走本中转后日志出现 `[CLASSIFIER-OUT] ... trimmed verdict='<block>...`，即可证实。
 
 ### 根因二：服务端——分类器 serving 间歇性不可用（非本工具范围）
 
@@ -113,11 +113,24 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 | `PROXY_HOST`                  | `127.0.0.1`                          | 监听地址 |
 | `PROXY_PORT`                  | `8008`                               | 监听端口 |
 | `UPSTREAM`                    | `https://api.deepseek.com/anthropic` | 上游 Anthropic 兼容端点 |
-| `MODEL_OVERRIDE`              | 空                                   | 统一改写 model 字段；留空则透传 CC 的 |
+| `MODEL_OVERRIDE`              | 空                                   | 仅分类器改写 model 字段；留空则透传 CC 的 |
 | `CLASSIFIER_CAP_MAX_TOKENS`   | `1`（开）                            | 分类器**去掉 `max_tokens`**，避免截断 |
 | `CLASSIFIER_NO_THINK`         | `1`（开）                            | 分类器补 `thinking:{"type":"disabled"}` |
+| `CLASSIFIER_DUMP_REQ`         | `0`（关）                            | 置 `1` 打印 CC 分类器**请求**全文，排障用 |
+| `CLASSIFIER_DUMP_RAW`         | `0`（关）                            | 置 `1` 打印上游分类器**响应**全文（改写前），排障用 |
 
-两个分类器开关都可独立置 `0`/`false`/`off` 关闭，用于对照排查。
+这些开关都可独立置 `0`/`false`/`off` 关闭，用于对照排查。
+
+排障打印是两个**独立**开关（会刷屏，仅排障时开）。只看返回时，只开 `CLASSIFIER_DUMP_RAW` 即可：
+
+```
+[..] [CLASSIFIER-RAW] 456B
+{"id":"...","content":[{"type":"text","text":"<block>no</block>"}],"usage":{...}}
+```
+
+- `CLASSIFIER_DUMP_REQ=1` → 额外打 `[CLASSIFIER-REQ]` 段（CC 原始请求体）；
+- `CLASSIFIER_DUMP_RAW=1` → 打 `[CLASSIFIER-RAW]` 段（**改写前**的上游响应原样 JSON），
+  用来确认 `verdict` 是否本来就不完整、token 到底花在哪。
 
 > `.env` 由 `proxy.py` 用标准库自行读取（零依赖），路径取脚本所在目录，与启动时的
 > cwd 无关；已存在的环境变量不会被 `.env` 覆盖。
@@ -146,26 +159,34 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 
 ## 验证
 
-启动后每笔**分类器**请求打三行日志（其余请求不打日志）：
+启动后每笔**分类器**请求打两行日志（进入一行、返回一行；其余请求不打日志）：
 
 ```
 [2026-10-08 22:06:00.545] [CLASSIFIER-IN] model=glm-5.3-flash max_tokens=2112 stream=False 命中=you are a security monitor thinking=<未设置>
-[2026-10-08 22:06:10.852] [CLASSIFIER-TRIM] verdict 位于第 0 块，丢 0 字前缀，保留 17B：块[text] 正文17B think0B out=7 stop=end_turn
-[2026-10-08 22:06:10.852] [CLASSIFIER-OUT] -> 200 trimmed 块[text] 正文17B think0B out=7 stop=end_turn
+[2026-10-08 22:06:10.852] [CLASSIFIER-OUT] -> 200 trimmed verdict='<block>no</block>' (块0丢0字) 块[text] 正文17B think0B out=7 stop=end_turn
 ```
 
 | 字段 | 含义 |
 |---|---|
 | `命中=` | 命中了哪条标记（`?` = 一条都没中，判定可能已失效） |
 | `thinking=` | CC **原样**发来的 thinking 字段（`<未设置>` = CC 没带，需中转补） |
+| `verdict=…` | 回给 CC 的**完整**最终文本（截取后，Python repr：能看出尾随空白）；`MISSING` 时是原样透传输出的尾部预览 |
+| `(块N丢M字)` | verdict 位于第 N 个 block；M = 丢弃的「前缀 + 其它块（含 thinking） + 被丢的 text 块」总长度 |
 | `块[...]` | 改写前响应里的 block 类型；出现 `thinking` 说明模型没听话、输出了推理 |
+| `正文…B` | 所有 text block 的合计字节数（即截取前的原文长度） |
 | `think…B` | thinking 块内容字节数（0 = 未输出推理） |
+| `other…B` | 除 text/thinking 外其它块的序列化字节数（`out` 远大于 `正文+think` 时看这里） |
 | `out=…` / `stop=…` | 上游报的 token 数与结束原因（`stop=max_tokens` = 又被截断了） |
 | `最后一段` | `trimmed` / `verdict=MISSING` / `pass-through(非JSON)` / `pass-through(无content)` |
 
 三种结果的含义：
 
-- **`trimmed`** —— 正常，verdict 已截取。
+- **`trimmed`** —— 正常，verdict 已截取。注意 `verdict=` 打印的是**完整**文本；若它不完整
+  （例如日志显示 `'<block>no'` 而 `正文9B`），说明上游本来就吐了残缺 verdict，
+  **不是中转截断的** —— 中转只丢 `verdict` 之前的内容，`<block>` 之后的每一个字符都保留。
+- **`out` 远大于 `正文+think+other`** —— token 花在了块之外（如上游未落进 `content` 的
+  推理），但**不影响正确性**：截取只看 `<block>` 起点。进一步追查请开
+  `CLASSIFIER_DUMP_RAW=1`，看 `[CLASSIFIER-RAW]` 里的原始响应全文。
 - **`verdict=MISSING`** —— 响应里找不到 `<block>`，**原样放行**交给 CC（fail-closed，
   不比不透传更差）。频繁出现说明模型没按契约输出，或标记词已过期。
 - **`pass-through(非JSON)`** —— 上游返回了非 JSON（网关偶发空 body），原样透传。
@@ -182,8 +203,9 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 
 ## 模型说明
 
-- 模型名透传不改，由 CC 的 `ANTHROPIC_MODEL` / `/model` 决定；也可用 `MODEL_OVERRIDE`
-  在代理侧强制统一。
+- 主请求模型名透传不改，由 CC 的 `ANTHROPIC_MODEL` / `/model` 决定。
+- `MODEL_OVERRIDE` **只作用于分类器请求**（如设成 `deepseek-chat` 这类轻量模型），
+  主对话仍用你在 CC 里选的模型；留空则分类器也跟随 CC 的 model。
 - 上游若是「单模型名多链路」网关，同一请求名可能被路由到不同后端 —— 日志里的
   `块[...]` 与 `think…B` 可帮你判断实际行为是否稳定。
 
