@@ -29,8 +29,10 @@ CC 的分类器调用只求一个 `<block>yes|no</block>` 结论，但非原生�
 3. **截取 `<block>` 及之后的内容** —— 丢掉模型写在 verdict 前面的推理/解释，
    让 CC 拿到的永远是「以 `<block>` 开头」的干净文本。
 
-> **关键：不换端点、不做协议转换。** 三步都作用在 Anthropic `/v1/messages` 上，
+> **关键：不做协议转换。** 三步都作用在 Anthropic `/v1/messages` 上，
 > 所以不依赖上游对 OpenAI 协议的实现、也不随上游模型映射变化而失效。
+> 分类器默认与普通请求同上游；可选配 `CLASSIFIER_UPSTREAM` 把分类器单独改发到
+> 另一个 Anthropic 兼容上游（协议不变），配 `CLASSIFIER_KEY` 换独立 key（见下表）。
 
 ## 实测效果（2026-10-08，cyzlab 网关 + GLM 后端）
 
@@ -97,8 +99,8 @@ ANTHROPIC_AUTH_TOKEN=<你的上游 API key>
 ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 ```
 
-之后 CC 的所有请求都走本地中转。中转会转发你的 API key，因此**只监听 127.0.0.1，
-不要暴露到局域网/公网**。
+之后 CC 的所有请求都走本地中转。中转会原样转发你的 API key（普通请求的认证头不会被替换，
+见下表），因此**只监听 127.0.0.1，不要暴露到局域网/公网**。
 
 ## 配置（环境变量，全部有默认值）
 
@@ -112,7 +114,9 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 |-------------------------------|--------------------------------------|------|
 | `PROXY_HOST`                  | `127.0.0.1`                          | 监听地址 |
 | `PROXY_PORT`                  | `8008`                               | 监听端口 |
-| `UPSTREAM`                    | `https://api.deepseek.com/anthropic` | 上游 Anthropic 兼容端点 |
+| `UPSTREAM`                    | `https://api.deepseek.com/anthropic` | 透传上游：非分类器请求原样转发到这里，认证头永不替换 |
+| `CLASSIFIER_UPSTREAM`         | 空                                   | 仅分类器改发的独立上游；留空与 `UPSTREAM` 同端点 |
+| `CLASSIFIER_KEY`              | 空                                   | 仅分类器替换认证头用的独立 key；留空则透传 CC 自带的 |
 | `MODEL_OVERRIDE`              | 空                                   | 仅分类器改写 model 字段；留空则透传 CC 的 |
 | `THINKING_OVERRIDE`           | 空                                   | 仅分类器覆盖思考强度；留空则不改（见下） |
 | `CLASSIFIER_CAP_MAX_TOKENS`   | `1`（开）                            | 分类器**去掉 `max_tokens`**，避免截断 |
@@ -130,9 +134,8 @@ ANTHROPIC_MODEL=<你的模型名>          # 或用 /model 切换
 
 | 值 | 效果 |
 |---|---|
-| `disabled` / `off` / `none` | `{"type":"disabled"}`，完全关闭思考 |
-| `low` / `medium` / `high` | `{"type":"enabled","budget_tokens":1024/4096/16384}`，**降档但不关闭** |
-| 任意数字 | 直接当 `budget_tokens` |
+| `disabled` / `off` / `none` | `thinking:{"type":"disabled"}`，完全关闭思考 |
+| `low` / `medium` / `high` | `thinking:{"type":"enabled"}` + `reasoning_effort:"low"/"medium"/"high"`，**降档但不关闭** |
 
 > **为什么需要它**：有些模型不认 `disabled`、**关不掉思考**，`CLASSIFIER_NO_THINK` 对它无效；
 > 这类模型可改用 `low`/`medium` 把推理预算压小，从而更快吐出 verdict。

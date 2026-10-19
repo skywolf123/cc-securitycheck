@@ -6,12 +6,14 @@ cc-securitycheck —— 本地中转，让 Claude Code 在非原生模型上也�
 作用：
   1. 分类器请求（auto 模式审批副作用工具前的那次独立调用）：去掉 max_tokens
      （不限制输出长度、消除截断）、补 thinking:{"type":"disabled"}（能识别的上游省掉推理）；
+     可选改发独立上游、换独立 key（CLASSIFIER_UPSTREAM / CLASSIFIER_KEY，默认均不启用）；
   2. 分类器响应：截取 <block> 及之后的内容，丢掉模型写在 verdict 前的推理，
      让 CC 拿到"以 <block> 开头"的干净文本；
-  3. 其余请求原样透传，思考强度完全跟随 Claude Code 的 effort 配置。
+  3. 其余请求原样透传 —— URL 与认证头一概不动，思考强度完全跟随 Claude Code 的 effort 配置。
 
-三步全部作用在 Anthropic /v1/messages 上 —— 不换端点、不做协议转换，
-因此不依赖上游对 OpenAI 协议的实现，也不随上游模型映射变化而失效。
+全部走 Anthropic /v1/messages 协议、不做协议转换，因此不依赖上游对 OpenAI 协议的实现，
+也不随上游模型映射变化而失效。分类器默认与透传同上游（不换端点）；
+仅显式配置 CLASSIFIER_UPSTREAM 时才把分类器改发到独立上游（协议不变）。
 分类器 system 要求 "Your ENTIRE response MUST begin with <block>"，
 非原生推理模型会先写推理，输出再被截断就永远吐不出 verdict，
 CC 解析不到即 fail-closed，拦下所有有副作用的工具。
@@ -65,18 +67,26 @@ _load_dotenv()  # 必须在下面读配置之前调用
 # ---------------------------------------------------------------------------
 HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "8008"))
+# 透传上游：所有普通（非分类器）请求原样转发到这里，认证头永远原样透传、永不替换。
 UPSTREAM = os.environ.get("UPSTREAM", "https://api.deepseek.com/anthropic")
+# 可选：分类器独立上游。非空 = 仅分类器请求改发到这里（仍走 Anthropic /v1/messages）；
+# 留空 = 分类器与普通请求同上游（默认）。普通请求永远走 UPSTREAM。
+CLASSIFIER_UPSTREAM = os.environ.get("CLASSIFIER_UPSTREAM", "").strip()
+# 可选：分类器独立 API key。非空 = 仅分类器请求把请求头的 x-api-key / Authorization
+# 替换为该 key（用于分类器走便宜中转、key 与 CC 自带认证不是同一把的场景）；
+# 留空 = 分类器认证头同样原样透传（默认）。对普通请求永不生效。
+CLASSIFIER_KEY = os.environ.get("CLASSIFIER_KEY", "").strip()
 # 可选：仅分类器改写 model 字段（如 "deepseek-chat"、"glm-4-flash" 等轻量模型）；
 # 留空则透传 CC 的 model。主请求永远透传，不受此项影响。
 MODEL_OVERRIDE = os.environ.get("MODEL_OVERRIDE", "").strip()
 
-# 可选：仅分类器覆盖思考强度（thinking 字段）。取值（大小写不敏感）：
-#   disabled / off / none —— {"type":"disabled"}，完全关闭思考；
-#   low / medium / high  —— {"type":"enabled","budget_tokens":...}，降档但不关闭；
+# 可选：仅分类器覆盖思考强度。取值（大小写不敏感）：
+#   disabled / off / none —— thinking:{"type":"disabled"}，完全关闭思考；
+#   low / medium / high  —— thinking:{"type":"enabled"} + reasoning_effort:"<档位>"，降档但不关闭；
 #   空                    —— 不覆盖（交由 CLASSIFIER_NO_THINK 决定是否补 disabled）。
 # 有些模型不认 disabled、无法关闭思考，可用这个降档减少推理。
+# 注意：不使用 thinking.budget_tokens（新模型已弃用），降档一律走 reasoning_effort。
 THINKING_OVERRIDE = os.environ.get("THINKING_OVERRIDE", "").strip()
-_THINK_BUDGETS = {"low": 1024, "medium": 4096, "high": 16384}
 
 # 分类器改写（均可在 .env 里置 0/false/off 关闭）：
 #   CLASSIFIER_CAP_MAX_TOKENS —— 去掉 max_tokens，让模型推完再出结论，不再被截断；
@@ -98,18 +108,19 @@ CLASSIFIER_DUMP_RAW = _env_bool("CLASSIFIER_DUMP_RAW")
 
 
 def build_thinking_override():
-    """把 THINKING_OVERRIDE 解析成 thinking 对象；未配置返回 None。"""
+    """把 THINKING_OVERRIDE 解析成 (thinking 值, reasoning_effort 值)；未配置/无法识别返回 None。
+
+    - disabled / off / none —— ({"type":"disabled"}, None)，完全关闭思考；
+    - low / medium / high  —— ({"type":"enabled"}, 档位)，两个字段都发：开思考并降档。
+    """
     v = THINKING_OVERRIDE.lower()
     if not v:
         return None
     if v in ("disabled", "off", "none"):
-        return {"type": "disabled"}
-    if v in _THINK_BUDGETS:
-        return {"type": "enabled", "budget_tokens": _THINK_BUDGETS[v]}
-    # 也接受裸数字，直接当 budget_tokens（上限给足，避免被上游截断）
-    if v.isdigit():
-        return {"type": "enabled", "budget_tokens": int(v)}
-    print("[warn] THINKING_OVERRIDE=%r 无法识别（可用 disabled/low/medium/high 或数字），忽略"
+        return ({"type": "disabled"}, None)
+    if v in ("low", "medium", "high"):
+        return ({"type": "enabled"}, v)
+    print("[warn] THINKING_OVERRIDE=%r 无法识别（可用 disabled/low/medium/high），忽略"
           % THINKING_OVERRIDE, flush=True)
     return None
 
@@ -272,7 +283,11 @@ class Handler(BaseHTTPRequestHandler):
             if CLASSIFIER_CAP_MAX_TOKENS and data.pop("max_tokens", None) is not None:
                 modified = True
             if THINKING_OVERRIDE_VALUE is not None:
-                data["thinking"] = THINKING_OVERRIDE_VALUE
+                think, effort = THINKING_OVERRIDE_VALUE
+                if think is not None:
+                    data["thinking"] = think
+                if effort is not None:
+                    data["reasoning_effort"] = effort
                 modified = True
             elif CLASSIFIER_NO_THINK:
                 data["thinking"] = {"type": "disabled"}
@@ -283,8 +298,11 @@ class Handler(BaseHTTPRequestHandler):
         if modified:
             body = json.dumps(data).encode("utf-8")
 
-        # 4. 构造上游请求
-        up = urlparse(UPSTREAM)
+        # 4. 构造上游请求。URL：普通请求一律 UPSTREAM；分类器优先 CLASSIFIER_UPSTREAM
+        #    （未配置回落 UPSTREAM）。key：一律原样透传，仅分类器且配置了 CLASSIFIER_KEY
+        #    时才替换 —— 普通请求的认证头一概不动。
+        up_url = (CLASSIFIER_UPSTREAM or UPSTREAM) if is_cls else UPSTREAM
+        up = urlparse(up_url)
         is_https = up.scheme == "https"
         upstream_host = up.hostname
         upstream_port = up.port or (443 if is_https else 80)
@@ -293,6 +311,14 @@ class Handler(BaseHTTPRequestHandler):
         hdrs = {k: v for k, v in self.headers.items()
                 if k.lower() not in ("host", "content-length", "connection",
                                      "transfer-encoding", "accept-encoding")}
+        if is_cls and CLASSIFIER_KEY:
+            # 仅分类器：配置了独立 key → 替换客户端认证头再转发。两种头都发以兼容两类上游：
+            # Anthropic 原生端点认 x-api-key，多数中转认 Authorization: Bearer。
+            # 先删后加：HTTP 头大小写不敏感而 dict 敏感，避免同名异写残留旧值。
+            for k in [k for k in hdrs if k.lower() in ("x-api-key", "authorization")]:
+                del hdrs[k]
+            hdrs["x-api-key"] = CLASSIFIER_KEY
+            hdrs["Authorization"] = "Bearer " + CLASSIFIER_KEY
         hdrs["Host"] = upstream_host
 
         Conn = http.client.HTTPSConnection if is_https else http.client.HTTPConnection
@@ -302,7 +328,7 @@ class Handler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
         except Exception as e:  # 上游不可达 → 可读的 502
             msg = json.dumps({"type": "proxy_error",
-                              "message": "cc-securitycheck 无法连接上游 %s: %s" % (UPSTREAM, e)}).encode("utf-8")
+                              "message": "cc-securitycheck 无法连接上游 %s: %s" % (up_url, e)}).encode("utf-8")
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(msg)))
@@ -483,14 +509,21 @@ def main():
     print("=" * 58, flush=True)
     print("cc-securitycheck 本地 DeepSeek 中转已启动", flush=True)
     print("  监听     : http://%s:%s" % (HOST, PORT), flush=True)
-    print("  上游     : %s" % UPSTREAM, flush=True)
     steps = []
+    if CLASSIFIER_UPSTREAM:
+        steps.append("改发上游->%s" % CLASSIFIER_UPSTREAM)
+    if CLASSIFIER_KEY:
+        steps.append("换key->***%s" % CLASSIFIER_KEY[-4:])
     if CLASSIFIER_CAP_MAX_TOKENS:
         steps.append("去掉 max_tokens")
     if THINKING_OVERRIDE_VALUE is not None:
-        steps.append("思考改写->%s" % json.dumps(THINKING_OVERRIDE_VALUE, ensure_ascii=False))
+        _, effort = THINKING_OVERRIDE_VALUE
+        if effort is not None:
+            steps.append("思考改写->%s（thinking:enabled+reasoning_effort）" % THINKING_OVERRIDE)
+        else:
+            steps.append("思考改写->%s（关闭思考）" % THINKING_OVERRIDE)
     elif CLASSIFIER_NO_THINK:
-        steps.append("think:disabled")
+        steps.append("思考关闭（CLASSIFIER_NO_THINK）")
     if MODEL_OVERRIDE:
         steps.append("模型改写->%s" % MODEL_OVERRIDE)
     print("  分类器   : %s（仅作用于分类器）" % (" + ".join(steps) or "原样透传"), flush=True)
@@ -498,8 +531,7 @@ def main():
         print("  排障打印 : %s" % " + ".join(
             n for n, on in (("请求全文", CLASSIFIER_DUMP_REQ),
                             ("响应全文", CLASSIFIER_DUMP_RAW)) if on), flush=True)
-    print("  其他请求 : 原样透传 %s（思考强度与模型跟随 CC 配置）" % UPSTREAM, flush=True)
-    print("  CC 配置  : ANTHROPIC_BASE_URL=http://%s:%s" % (HOST, PORT), flush=True)
+    print("  其他请求 : 原样透传 %s（key 永远透传，思考强度与模型跟随 CC 配置）" % UPSTREAM, flush=True)
     print("=" * 58, flush=True)
     try:
         server.serve_forever()
